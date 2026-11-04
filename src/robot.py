@@ -3,10 +3,13 @@
 """
 Módulo procedural del Franka Emika Panda para la planta industrial MuJoCo.
 
-IMPORTANTE:
-- No usa POO.
-- No define clases.
-- Toda la lógica del robot está separada de planta_4_cintas.py.
+IMPORTANTE (Práctica I):
+- Este módulo es el componente PROPORCIONADO de cinemática inversa (IK) del
+  Panda. Se utiliza como "caja negra": NO se ha modificado el algoritmo.
+- La única adaptación respecto al original es la ruta raíz del proyecto, ya
+  que el fichero ahora reside en src/.
+- La interfaz orientada a objetos del robot es la clase EstacionRobotizada
+  (src/estacion_robotizada.py), que envuelve estas funciones.
 - El modelo del Panda se carga desde MuJoCo Menagerie.
 """
 
@@ -69,7 +72,7 @@ def make_config(lane, branch_y, branch_speed):
 # -----------------------------------------------------------------------------
 def find_franka_model():
     """Localiza panda.xml en rutas habituales o mediante variable de entorno."""
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent
     candidates = []
 
     env_path = os.environ.get("MUJOCO_MENAGERIE_PATH", "").strip()
@@ -92,7 +95,7 @@ def find_franka_model():
 
 def download_franka_model():
     """Descarga de forma sparse el modelo oficial si todavía no está local."""
-    root = Path(__file__).resolve().parent
+    root = Path(__file__).resolve().parent.parent
     vendor_root = root / "vendor"
     repo_dir = vendor_root / "mujoco_menagerie"
     panda_xml = repo_dir / "franka_emika_panda" / "panda.xml"

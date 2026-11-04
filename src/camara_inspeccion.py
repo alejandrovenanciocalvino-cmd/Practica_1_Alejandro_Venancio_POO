@@ -1,101 +1,131 @@
-"""Clase CamaraInspeccion.
-Captura la imagen desde MuJoCo, la procesa con OpenCV y detecta la forma
-geométrica del objeto. Cuando detecta una pieza, actualiza la variable
-booleana `objeto_detectado` y comunica a la cinta asociada que debe
-detenerse."""
+# -*- coding: utf-8 -*-
+"""Cámaras de la planta: captura, visión y control de la cinta asociada."""
 
-from __future__ import annotations
-from typing import Optional
 import cv2
-import numpy as np
 
-from .cinta_transportadora import CintaTransportadora
+from .vision import DetectorFormas
 
 
-class CamaraInspeccion:
-    """Cámara de inspección asociada a una cinta concreta."""
+class Camara:
+    """Cámara MuJoCo genérica: sabe capturar una imagen (BGR para OpenCV)."""
 
-    def __init__(self, nombre_camara: str, etiqueta: str,
-                 cinta: CintaTransportadora):
-        self.nombre_camara = nombre_camara       # nombre en el MJCF
-        self.etiqueta = etiqueta                 # texto para el mosaico
-        self.cinta = cinta                       # COMPOSICIÓN
-        self.objeto_detectado: bool = False
-        self.forma_detectada: Optional[str] = None
+    def __init__(self, nombre, titulo=None):
+        self.nombre = nombre
+        self.titulo = titulo or nombre
+        self.imagen_cruda = None
+        self.imagen = None
 
-    # ---------- captura ----------
-    def capturar(self, renderer, data) -> np.ndarray:
-        renderer.update_scene(data, camera=self.nombre_camara)
+    def capturar(self, renderer, data):
+        renderer.update_scene(data, camera=self.nombre)
         rgb = renderer.render()
-        return cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        self.imagen_cruda = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        self.imagen = self.imagen_cruda
+        return self.imagen_cruda
 
-    # ---------- detección de forma ----------
-    def detectar_forma(self, imagen: np.ndarray) -> Optional[str]:
-        """Devuelve 'circulo', 'cuadrado', 'rectangulo' o None."""
-        gray = cv2.cvtColor(imagen, cv2.COLOR_BGR2GRAY)
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
-        _, th = cv2.threshold(blur, 0, 255,
-                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        # Eliminar la banda negra inferior (suelo) si aparece
-        th[: th.shape[0] // 3, :] = 0
+    def refrescar(self, renderer, data):
+        """Captura sin ejecutar lógica (p. ej. en pausa)."""
+        self.capturar(renderer, data)
+        return self.imagen
 
-        contornos, _ = cv2.findContours(
-            th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    def texto_estado(self):
+        return ""
 
-        mejor = None
-        mejor_area = 0
-        for c in contornos:
-            area = cv2.contourArea(c)
-            if area < 400:            # filtrar ruido
-                continue
-            if area > mejor_area:
-                mejor_area = area
-                mejor = c
+    def hay_alarma(self):
+        return False
 
-        if mejor is None:
-            return None
 
-        # Aproximación poligonal
-        perimetro = cv2.contourPerimeter(mejor)
-        approx = cv2.approxPolyDP(mejor, 0.04 * perimetro, True)
-        n_vertices = len(approx)
+class CamaraInspeccion(Camara):
+    """Cámara de inspección asociada a una cinta.
 
-        # Circularidad
-        circularidad = (4 * np.pi * mejor_area) / (perimetro * perimetro + 1e-6)
+    Cada vez que se actualiza: captura -> detecta forma -> actualiza
+    `objeto_detectado` -> si hay pieza en la zona de inspección, detiene su
+    cinta. La reanudación es una decisión controlada (ver `_decidir`):
+      LIBRE          esperando una pieza
+      INSPECCIONANDO cinta parada por esta cámara
+      DESPEJANDO     pieza ya inspeccionada: no se vuelve a parar hasta que
+                     la zona quede libre (evita parar dos veces por la misma pieza)
+    """
 
-        if circularidad > 0.78:
-            return "circulo"
-        if n_vertices == 4:
-            x, y, w, h = cv2.boundingRect(approx)
-            aspect = w / (h + 1e-6)
-            if 0.85 <= aspect <= 1.15:
-                return "cuadrado"
-            return "rectangulo"
-        # Otros polígonos: los tratamos como rectángulo genérico
-        return "rectangulo"
+    LIBRE, INSPECCIONANDO, DESPEJANDO = "LIBRE", "INSPECCIONANDO", "DESPEJANDO"
 
-    # ---------- actualización por paso ----------
-    def actualizar(self, renderer, data) -> np.ndarray:
-        """Captura, detecta y devuelve la imagen etiquetada."""
+    def __init__(self, nombre, cinta, titulo=None, vision=None,
+                 tiempo_inspeccion=2.0, reanudacion_automatica=True):
+        super().__init__(nombre, titulo or cinta.nombre)
+        self.cinta = cinta
+        self.vision = vision or DetectorFormas()
+        self.tiempo_inspeccion = tiempo_inspeccion
+        self.reanudacion_automatica = reanudacion_automatica
+
+        self.objeto_detectado = False     # pieza en la zona de inspección
+        self.pieza_visible = False        # pieza en cualquier parte del campo de visión
+        self.forma_detectada = None
+        self.deteccion = None
+        self.detecciones = []
+        self.estado = self.LIBRE
+        self._t_parada = 0.0
+
+    # ----------------------------------------------------------------- visión
+    def detectar_forma(self, imagen):
+        """Procesa la imagen BGR; devuelve la forma de la pieza en zona o None."""
+        self.detecciones = self.vision.detectar(imagen)
+        self.pieza_visible = len(self.detecciones) > 0
+        en_zona = [d for d in self.detecciones if d.en_zona]
+        self.deteccion = en_zona[0] if en_zona else None
+        return self.deteccion.forma if self.deteccion else None
+
+    # ---------------------------------------------------------------- control
+    def _decidir(self, ahora):
+        if self.estado == self.LIBRE:
+            if self.objeto_detectado:
+                if self.cinta.esta_activa():
+                    self.cinta.detener(motivo=f"camara:{self.nombre}")
+                    self.estado = self.INSPECCIONANDO
+                    self._t_parada = ahora
+                    print(f"[{self.nombre}] pieza '{self.forma_detectada}' detectada "
+                          f"-> {self.cinta.nombre} DETENIDA")
+                else:
+                    self.estado = self.DESPEJANDO   # ya estaba parada por el operario
+        elif self.estado == self.INSPECCIONANDO:
+            if self.cinta.esta_activa():            # el operario la ha rearrancado
+                self.estado = self.DESPEJANDO
+            elif (self.reanudacion_automatica
+                  and ahora - self._t_parada >= self.tiempo_inspeccion):
+                self.cinta.arrancar()
+                self.estado = self.DESPEJANDO
+                print(f"[{self.nombre}] inspección terminada -> {self.cinta.nombre} reanudada")
+        elif self.estado == self.DESPEJANDO:
+            if not self.objeto_detectado:
+                self.estado = self.LIBRE
+
+    def procesar(self, imagen, tiempo):
+        self.forma_detectada = self.detectar_forma(imagen)
+        self.objeto_detectado = self.forma_detectada is not None
+        self._decidir(tiempo)
+        self.imagen = self.vision.dibujar(imagen, self.detecciones)
+
+    def actualizar(self, renderer, data):
+        """Ciclo completo. Devuelve la imagen anotada (BGR)."""
         imagen = self.capturar(renderer, data)
-        forma = self.detectar_forma(imagen)
+        self.procesar(imagen, float(data.time))
+        return self.imagen
 
-        self.forma_detectada = forma
-        self.objeto_detectado = forma is not None
+    def refrescar(self, renderer, data):
+        imagen = self.capturar(renderer, data)
+        self.imagen = self.vision.dibujar(imagen, self.detecciones)
+        return self.imagen
 
-        # Comunicación con la cinta (composición)
-        if self.objeto_detectado:
-            self.cinta.detener()
+    def reiniciar(self):
+        self.objeto_detectado = False
+        self.pieza_visible = False
+        self.forma_detectada = None
+        self.deteccion = None
+        self.detecciones = []
+        self.estado = self.LIBRE
 
-        # Etiquetado visual
-        color = (0, 220, 0) if self.objeto_detectado else (200, 200, 200)
-        texto = f"{self.etiqueta}  |  {forma or '---'}"
-        cv2.rectangle(imagen, (0, 0), (imagen.shape[1], 36), (20, 20, 20), -1)
-        cv2.putText(imagen, texto, (12, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2, cv2.LINE_AA)
-        return imagen
+    def texto_estado(self):
+        forma = self.forma_detectada or "-"
+        cinta = "ON" if self.cinta.esta_activa() else "OFF"
+        return f"{self.estado[:5]} | forma: {forma} | cinta {cinta}"
 
-    def __repr__(self) -> str:
-        return (f"CamaraInspeccion({self.nombre_camara}, "
-                f"cinta={self.cinta.nombre}, "
-                f"detectado={self.objeto_detectado}, forma={self.forma_detectada})")
+    def hay_alarma(self):
+        return self.objeto_detectado and not self.cinta.esta_activa()

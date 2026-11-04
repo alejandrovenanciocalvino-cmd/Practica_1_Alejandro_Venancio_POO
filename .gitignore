@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.venv/
+vendor/
+capturas/
+.pytest_cache/
